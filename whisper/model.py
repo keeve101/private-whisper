@@ -7,7 +7,9 @@ from typing import Dict, Iterable, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import Tensor, nn
+from torch.nn import AvgPool1d, ReLU
+from torch import Tensor, nn, device as Device, dtype as DataType
+from typing import Optional, final
 
 from .decoding import decode as decode_function
 from .decoding import detect_language as detect_language_function
@@ -171,6 +173,183 @@ class ResidualAttentionBlock(nn.Module):
         return x
 
 
+
+class EnergyProjection(nn.Module):
+    def __init__(
+        self,
+        model_dim: int,
+        num_layers: int,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+
+        if num_layers < 1:
+            raise ValueError(
+                f"Invalid `num_layers`: {num_layers} for EnergyProjectionLayer."
+            )
+
+        self.layers = nn.ModuleList()
+
+        for _ in range(num_layers):
+            self.layers.append(
+                Linear(model_dim, model_dim, bias)
+            )
+            self.layers.append(ReLU())
+
+    def forward(self, seqs: Tensor) -> Tensor:
+        for layer in self.layers:
+            seqs = layer(seqs)
+        return seqs
+
+
+@final
+class PChooseLayer(nn.Module):
+    """Represents a PChoose layer."""
+
+    model_dim: int
+    num_heads: int
+    energy_bias: nn.Parameter
+    monotonic_temperature: float
+    q_energy_proj: EnergyProjection
+    k_energy_proj: EnergyProjection
+    keys_pooling: AvgPool1d
+
+    def __init__(
+        self,
+        model_dim: int,
+        num_heads: int,
+        energy_bias_value: float,
+        monotonic_temperature: float,
+        num_monotonic_energy_layers: int,
+        pre_decision_ratio: int,
+        *,
+        bias: bool = True,
+    ) -> None:
+        """
+        :param model_dim:
+            The dimensionality of the model.
+        :param num_heads:
+            The number of attention heads.
+        :param bias:
+            If ``True``, query, key energy projection layers learn an
+            additive bias.
+        """
+        super().__init__()
+
+        self.model_dim = model_dim
+        self.num_heads = num_heads
+
+        if energy_bias_value != 0.0:
+            self.energy_bias = nn.Parameter(
+                torch.full([1], energy_bias_value)
+            )
+        else:
+            self.register_module("energy_bias", None)
+
+        self.monotonic_temperature = monotonic_temperature
+
+        if num_monotonic_energy_layers <= 0:
+            raise ValueError("Number of monotonic energy layers must be > 0.")
+
+        self.q_energy_proj = EnergyProjection(
+            self.model_dim,
+            num_monotonic_energy_layers,
+            bias,
+        )
+        self.k_energy_proj = EnergyProjection(
+            self.model_dim,
+            num_monotonic_energy_layers,
+            bias,
+        )
+
+        self.keys_pooling = AvgPool1d(
+            kernel_size=pre_decision_ratio,
+            stride=pre_decision_ratio,
+            ceil_mode=True,
+        )
+
+    def forward(self, seqs: Tensor, keys: Tensor) -> Tensor:
+        q = self.q_energy_proj(seqs)
+
+        # (N, S, M) -> (N, H, S, K)
+        q = q.unflatten(-1, (self.num_heads, -1)).transpose(1, 2)
+
+        # (N, S_kv, M) -> (N, M, S_kv) -> (N, M, S_p)
+        pooled_keys = self.keys_pooling(keys.transpose(1, 2))
+
+        # (N, M, S_p) -> (N, S_p, M)
+        pooled_keys = pooled_keys.transpose(1, 2)
+
+        k = self.k_energy_proj(pooled_keys)
+
+        # (N, S_p, M) -> (N, H, S_p, K)
+        k = k.unflatten(-1, (self.num_heads, -1)).transpose(1, 2)
+
+        # (N, H, S, K) @ (N, H, K, S_p) = (N, H, S, S_p)
+        monotonic_energy = torch.matmul(q, k.transpose(-1, -2))
+
+        monotonic_energy = monotonic_energy * (q.size(-1) ** -0.5)
+
+        if self.energy_bias is not None:
+            monotonic_energy += self.energy_bias.to(seqs.dtype)
+
+        # p_choose: (N, H, S, S_p)
+        p_choose = torch.sigmoid(monotonic_energy / self.monotonic_temperature)
+
+        return p_choose
+
+
+class MonotonicResidualAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        n_state: int,
+        n_head: int,
+        energy_bias_value=0.5,
+        monotonic_temperature=0.2,
+        num_monotonic_energy_layers=4,
+        pre_decision_ratio=2,
+    ):
+        super().__init__()
+
+        self.attn = MultiHeadAttention(n_state, n_head)
+        self.attn_ln = LayerNorm(n_state)
+
+        self.cross_attn = MultiHeadAttention(n_state, n_head)
+        self.cross_attn_ln = LayerNorm(n_state)
+
+        n_mlp = n_state * 4
+        self.mlp = nn.Sequential(
+            Linear(n_state, n_mlp), nn.GELU(), Linear(n_mlp, n_state)
+        )
+        self.mlp_ln = LayerNorm(n_state)
+
+        self.p_choose_layer = PChooseLayer(
+            n_state,
+            n_head,
+            energy_bias_value,
+            monotonic_temperature,
+            num_monotonic_energy_layers,
+            pre_decision_ratio,
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+        xa: Optional[Tensor] = None,
+        mask: Optional[Tensor] = None,
+        kv_cache: Optional[dict] = None,
+    ):
+        x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
+
+        x_norm = self.cross_attn_ln(x)
+        p_choose = self.p_choose_layer(x_norm, xa)
+        x = x + self.cross_attn(x_norm, xa, kv_cache=kv_cache)[0]
+
+        x = x + self.mlp(self.mlp_ln(x))
+
+        return x, p_choose
+
+
 class AudioEncoder(nn.Module):
     def __init__(
         self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
@@ -247,6 +426,66 @@ class TextDecoder(nn.Module):
         ).float()
 
         return logits
+
+
+class MonotonicTextDecoder(nn.Module):
+    def __init__(
+        self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int,
+        energy_bias_value=0.5,
+        monotonic_temperature=0.2,
+        num_monotonic_energy_layers=4,
+        pre_decision_ratio=2,
+    ):
+        super().__init__()
+
+        self.token_embedding = nn.Embedding(n_vocab, n_state)
+        self.positional_embedding = nn.Parameter(torch.empty(n_ctx, n_state))
+
+        self.blocks: Iterable[MonotonicResidualAttentionBlock] = nn.ModuleList(
+            [
+                MonotonicResidualAttentionBlock(
+                    n_state, n_head,
+                    energy_bias_value,
+                    monotonic_temperature,
+                    num_monotonic_energy_layers,
+                    pre_decision_ratio)
+                for _ in range(n_layer)
+            ]
+        )
+        self.ln = LayerNorm(n_state)
+
+        mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
+        self.register_buffer("mask", mask, persistent=False)
+
+    def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
+        """
+        x : torch.LongTensor, shape = (batch_size, <= n_ctx)
+            the text tokens
+        xa : torch.Tensor, shape = (batch_size, n_audio_ctx, n_audio_state)
+            the encoded audio features to be attended on
+        """
+        offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
+        x = (
+            self.token_embedding(x)
+            + self.positional_embedding[offset : offset + x.shape[-1]]
+        )
+        x = x.to(xa.dtype)
+
+        p_choose_list: list[Tensor] = []
+
+        for block in self.blocks:
+            x, p_choose = block(x, xa, mask=self.mask, kv_cache=kv_cache)
+            p_choose_list.append(p_choose)
+
+        x = self.ln(x)
+        logits = (
+            x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)
+        ).float()
+
+        p_choose = torch.cat(p_choose_list, dim=0)
+        p_choose = p_choose.flatten(0, 1)
+
+        return logits, p_choose
 
 
 class Whisper(nn.Module):
