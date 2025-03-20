@@ -2,13 +2,13 @@ import base64
 import gzip
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple, List
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn import AvgPool1d, ReLU
-from torch import Tensor, nn, device as Device, dtype as DataType
+from torch import Tensor, nn
 from typing import Optional, final
 
 from .decoding import decode as decode_function
@@ -36,6 +36,18 @@ class ModelDimensions:
     n_text_state: int
     n_text_head: int
     n_text_layer: int
+
+
+@dataclass
+class StreamingConfig:
+    monotonic_temperature: float = 0.2
+    num_monotonic_energy_layers: int = 4
+    pre_decision_ratio: int = 2
+    energy_bias_value: float = -0.5
+
+    p_choose_start_layer: int = 0
+    decision_method = "min"
+    decision_threshold: float = 0.5
 
 
 class LayerNorm(nn.LayerNorm):
@@ -218,10 +230,7 @@ class PChooseLayer(nn.Module):
         self,
         model_dim: int,
         num_heads: int,
-        energy_bias_value: float,
-        monotonic_temperature: float,
-        num_monotonic_energy_layers: int,
-        pre_decision_ratio: int,
+        streaming_config: StreamingConfig,
         *,
         bias: bool = True,
     ) -> None:
@@ -239,32 +248,32 @@ class PChooseLayer(nn.Module):
         self.model_dim = model_dim
         self.num_heads = num_heads
 
-        if energy_bias_value != 0.0:
+        if streaming_config.energy_bias_value != 0.0:
             self.energy_bias = nn.Parameter(
-                torch.full([1], energy_bias_value)
+                torch.full([1], streaming_config.energy_bias_value)
             )
         else:
             self.register_module("energy_bias", None)
 
-        self.monotonic_temperature = monotonic_temperature
+        self.monotonic_temperature = streaming_config.monotonic_temperature
 
-        if num_monotonic_energy_layers <= 0:
+        if streaming_config.num_monotonic_energy_layers <= 0:
             raise ValueError("Number of monotonic energy layers must be > 0.")
 
         self.q_energy_proj = EnergyProjection(
             self.model_dim,
-            num_monotonic_energy_layers,
+            streaming_config.num_monotonic_energy_layers,
             bias,
         )
         self.k_energy_proj = EnergyProjection(
             self.model_dim,
-            num_monotonic_energy_layers,
+            streaming_config.num_monotonic_energy_layers,
             bias,
         )
 
         self.keys_pooling = AvgPool1d(
-            kernel_size=pre_decision_ratio,
-            stride=pre_decision_ratio,
+            kernel_size=streaming_config.pre_decision_ratio,
+            stride=streaming_config.pre_decision_ratio,
             ceil_mode=True,
         )
 
@@ -304,10 +313,7 @@ class MonotonicResidualAttentionBlock(nn.Module):
         self,
         n_state: int,
         n_head: int,
-        energy_bias_value=0.5,
-        monotonic_temperature=0.2,
-        num_monotonic_energy_layers=4,
-        pre_decision_ratio=2,
+        streaming_config: StreamingConfig,
     ):
         super().__init__()
 
@@ -326,10 +332,7 @@ class MonotonicResidualAttentionBlock(nn.Module):
         self.p_choose_layer = PChooseLayer(
             n_state,
             n_head,
-            energy_bias_value,
-            monotonic_temperature,
-            num_monotonic_energy_layers,
-            pre_decision_ratio,
+            streaming_config,
         )
 
     def forward(
@@ -431,10 +434,7 @@ class TextDecoder(nn.Module):
 class MonotonicTextDecoder(nn.Module):
     def __init__(
         self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int,
-        energy_bias_value=0.5,
-        monotonic_temperature=0.2,
-        num_monotonic_energy_layers=4,
-        pre_decision_ratio=2,
+        streaming_config: StreamingConfig,
     ):
         super().__init__()
 
@@ -443,12 +443,7 @@ class MonotonicTextDecoder(nn.Module):
 
         self.blocks: Iterable[MonotonicResidualAttentionBlock] = nn.ModuleList(
             [
-                MonotonicResidualAttentionBlock(
-                    n_state, n_head,
-                    energy_bias_value,
-                    monotonic_temperature,
-                    num_monotonic_energy_layers,
-                    pre_decision_ratio)
+                MonotonicResidualAttentionBlock(n_state, n_head, streaming_config)
                 for _ in range(n_layer)
             ]
         )
@@ -457,7 +452,7 @@ class MonotonicTextDecoder(nn.Module):
         mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
+    def decode_with_pchoose(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
         """
         x : torch.LongTensor, shape = (batch_size, <= n_ctx)
             the text tokens
@@ -471,7 +466,7 @@ class MonotonicTextDecoder(nn.Module):
         )
         x = x.to(xa.dtype)
 
-        p_choose_list: list[Tensor] = []
+        p_choose_list: List[Tensor] = []
 
         for block in self.blocks:
             x, p_choose = block(x, xa, mask=self.mask, kv_cache=kv_cache)
@@ -486,6 +481,9 @@ class MonotonicTextDecoder(nn.Module):
         p_choose = p_choose.flatten(0, 1)
 
         return logits, p_choose
+
+    def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
+        self.decode_with_pchoose(x, xa, kv_cache)[0]
 
 
 class Whisper(nn.Module):
@@ -582,3 +580,86 @@ class Whisper(nn.Module):
     detect_language = detect_language_function
     transcribe = transcribe_function
     decode = decode_function
+
+class WhisperStreaming(Whisper):
+    def __init__(self, dims: ModelDimensions, streaming_config: StreamingConfig):
+        super().__init__(dims)
+        self.streaming_config = streaming_config
+        self.decoder = MonotonicTextDecoder(
+            self.dims.n_vocab,
+            self.dims.n_text_ctx,
+            self.dims.n_text_state,
+            self.dims.n_text_head,
+            self.dims.n_text_layer,
+            streaming_config,
+        )
+
+    def set_alignment_heads(self, dump: bytes):
+        array = np.frombuffer(
+            gzip.decompress(base64.b85decode(dump)), dtype=bool
+        ).copy()
+        mask = torch.from_numpy(array).reshape(
+            self.dims.n_text_layer, self.dims.n_text_head
+        )
+        self.register_buffer("alignment_heads", mask.to_sparse(), persistent=False)
+
+    def embed_audio(self, mel: torch.Tensor):
+        return self.encoder(mel)
+
+    def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor):
+        return self.decoder(tokens, audio_features)
+
+    def forward(
+        self, mel: torch.Tensor, tokens: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        return self.decoder(tokens, self.encoder(mel))
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
+    def is_multilingual(self):
+        return self.dims.n_vocab >= 51865
+
+    @property
+    def num_languages(self):
+        return self.dims.n_vocab - 51765 - int(self.is_multilingual)
+
+    def install_kv_cache_hooks(self, cache: Optional[dict] = None):
+        """
+        The `MultiHeadAttention` module optionally accepts `kv_cache` which stores the key and value
+        tensors calculated for the previous positions. This method returns a dictionary that stores
+        all caches, and the necessary hooks for the key and value projection modules that save the
+        intermediate tensors to be reused during later calculations.
+
+        Returns
+        -------
+        cache : Dict[nn.Module, torch.Tensor]
+            A dictionary object mapping the key/value projection modules to its cache
+        hooks : List[RemovableHandle]
+            List of PyTorch RemovableHandle objects to stop the hooks to be called
+        """
+        cache = {**cache} if cache is not None else {}
+        hooks = []
+
+        def save_to_cache(module, _, output):
+            if module not in cache or output.shape[1] > self.dims.n_text_ctx:
+                # save as-is, for the first token or cross attention
+                cache[module] = output
+            else:
+                cache[module] = torch.cat([cache[module], output], dim=1).detach()
+            return cache[module]
+
+        def install_hooks(layer: nn.Module):
+            if isinstance(layer, MultiHeadAttention):
+                hooks.append(layer.key.register_forward_hook(save_to_cache))
+                hooks.append(layer.value.register_forward_hook(save_to_cache))
+
+        self.decoder.apply(install_hooks)
+        return cache, hooks
+
+    detect_language = detect_language_function
+    transcribe = transcribe_function
+    decode = decode_function
+

@@ -158,6 +158,7 @@ def transcribe(
 
     language: str = decode_options["language"]
     task: str = decode_options.get("task", "transcribe")
+
     tokenizer = get_tokenizer(
         model.is_multilingual,
         num_languages=model.num_languages,
