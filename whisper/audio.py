@@ -144,6 +144,7 @@ def log_mel_spectrogram(
         audio = audio.to(device)
     if padding > 0:
         audio = F.pad(audio, (0, padding))
+
     window = torch.hann_window(N_FFT).to(audio.device)
     stft = torch.stft(audio, N_FFT, HOP_LENGTH, window=window, return_complex=True)
     magnitudes = stft[..., :-1].abs() ** 2

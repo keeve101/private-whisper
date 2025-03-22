@@ -11,8 +11,10 @@ from torch.nn import AvgPool1d, ReLU
 from torch import Tensor, nn
 from typing import Optional, final
 
+
 from .decoding import decode as decode_function
 from .decoding import detect_language as detect_language_function
+from .streaming import StreamingConfig, transcribe_stream as transcribe_stream_function
 from .transcribe import transcribe as transcribe_function
 
 try:
@@ -36,18 +38,6 @@ class ModelDimensions:
     n_text_state: int
     n_text_head: int
     n_text_layer: int
-
-
-@dataclass
-class StreamingConfig:
-    monotonic_temperature: float = 0.2
-    num_monotonic_energy_layers: int = 4
-    pre_decision_ratio: int = 2
-    energy_bias_value: float = -0.5
-
-    p_choose_start_layer: int = 0
-    decision_method = "min"
-    decision_threshold: float = 0.5
 
 
 class LayerNorm(nn.LayerNorm):
@@ -662,4 +652,4 @@ class WhisperStreaming(Whisper):
     detect_language = detect_language_function
     transcribe = transcribe_function
     decode = decode_function
-
+    transcribe_stream = transcribe_stream_function

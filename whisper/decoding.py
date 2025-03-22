@@ -13,6 +13,7 @@ from .utils import compression_ratio
 
 if TYPE_CHECKING:
     from .model import Whisper
+    from .model import WhisperStreaming
 
 
 @torch.no_grad()
@@ -174,6 +175,21 @@ class PyTorchInference(Inference):
             for module in self.kv_modules:
                 # update the key/value cache to contain the selected sequences
                 self.kv_cache[module] = self.kv_cache[module][source_indices].detach()
+
+
+class MonotonicPyTorchInference(PyTorchInference):
+    def __init__(self, model: "WhisperStreaming", initial_token_length: int):
+        super().__init__(model, initial_token_length)
+
+    def decode_with_pchoose(self, tokens: Tensor, audio_features: Tensor) -> Tensor:
+        if not self.kv_cache:
+            self.kv_cache, self.hooks = self.model.install_kv_cache_hooks()
+
+        if tokens.shape[-1] > self.initial_token_length:
+            # only need to use the last token except in the first forward pass
+            tokens = tokens[:, -1:]
+
+        return self.model.decoder.decode_with_pchoose(tokens, audio_features, kv_cache=self.kv_cache)
 
 
 class SequenceRanker:
@@ -511,7 +527,7 @@ class DecodingTask:
     decoder: TokenDecoder
     logit_filters: List[LogitFilter]
 
-    def __init__(self, model: "Whisper", options: DecodingOptions):
+    def __init__(self, model: "Whisper", options: DecodingOptions, inference_cls=PyTorchInference):
         self.model = model
 
         language = options.language or "en"
@@ -537,7 +553,7 @@ class DecodingTask:
         self.sot_index: int = self.initial_tokens.index(tokenizer.sot)
 
         # inference: implements the forward pass through the decoder, including kv caching
-        self.inference = PyTorchInference(model, len(self.initial_tokens))
+        self.inference = inference_cls(model, len(self.initial_tokens))
 
         # sequence ranker: implements how to rank a group of sampled sequences
         self.sequence_ranker = MaximumLikelihoodRanker(options.length_penalty)
