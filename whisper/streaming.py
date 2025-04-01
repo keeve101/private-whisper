@@ -8,7 +8,7 @@ from dataclasses import replace, dataclass
 import torch.nn.functional as F
 
 from .decoding import DecodingOptions, DecodingTask, MonotonicPyTorchInference
-from .audio import CHUNK_LENGTH, FRAMES_PER_SECOND, HOP_LENGTH, load_audio, log_mel_spectrogram
+from .audio import CHUNK_LENGTH, FRAMES_PER_SECOND, HOP_LENGTH, N_FRAMES, load_audio, log_mel_spectrogram, pad_or_trim
 
 if TYPE_CHECKING:
     from .model import WhisperStreaming
@@ -75,7 +75,7 @@ class StreamingAudioFeatureExtractor(StreamingAgent):
         Returns (n_mels, n_frames)
         """
         samples = np.concatenate((self.previous_residual_samples, input))
-        if len(samples) < self.chunk_size:
+        if len(samples) < self.chunk_size and not source_finished:
             self.previous_residual_samples = samples
             return
         
@@ -105,10 +105,13 @@ class OfflineAudioEncoder(StreamingAgent):
             self.mels = torch.cat((self.mels, input), dim=1)
             self.mels = self.mels[:, -self.max_frames:]
 
-        if self.mels.shape[1] < self.min_frames:
+        if self.mels.shape[1] < self.min_frames and not source_finished:
             return
 
-        input_mels = F.pad(self.mels.unsqueeze(0), (0, 3000 - self.mels.shape[-1]))
+        input_mels = pad_or_trim(self.mels.unsqueeze(0), length=N_FRAMES)
+        # input_mels = F.pad(self.mels.unsqueeze(0), (0, 3000 - self.mels.shape[-1]))
+
+        debug("encoder len", self.mels.shape)
 
         return self.model.embed_audio(input_mels)
 
@@ -128,6 +131,7 @@ class StreamingDecoder(StreamingAgent):
     def run_decoder(
         self, tokens: Tensor,
     ) -> Tuple[Tensor, bool, float, Tensor]:
+        debug(self.task.tokenizer.decode(tokens.tolist()))
         tokens = tokens.unsqueeze(0)
 
         logits, p_choose = self.task.inference.decode_with_pchoose(tokens, self.encoder_output)
@@ -167,11 +171,12 @@ class StreamingDecoder(StreamingAgent):
         debug('READ')
         self.encoder_output = input
         initial_tokens_len = len(self.task.initial_tokens)
-        pred_tokens: Tensor = torch.tensor(self.task.initial_tokens, device=self.device)
+        pred_tokens: Tensor = torch.tensor(list(self.task.initial_tokens) + self.target_sequence, device=self.device)
         finished = False
         decoder_features_out = None
 
         self.task.decoder.reset()
+        self.task.inference.cleanup_caching()
 
         while True:
             updated_tokens, reached_eos, prob, decoder_features = self.run_decoder(pred_tokens)
@@ -189,22 +194,26 @@ class StreamingDecoder(StreamingAgent):
             ):
                 if prob == 1.0:
                     pred_tokens = torch.tensor(self.task.initial_tokens)
+                debug('break early stop?', self.streaming_config.no_early_stop, source_finished, prob, reached_eos)
                 break
 
             if (
                 finished or reached_eos
                 or len(self.target_sequence) + pred_tokens.shape[0] > self.max_len(self.encoder_output)
             ):
+                debug('break finished', finished, reached_eos)
                 finished = True
                 break
 
             if prob < self.streaming_config.decision_threshold and not source_finished:
+                debug('break read', prob, source_finished)
                 break
 
             if (
                 len(self.target_sequence) + pred_tokens.shape[0] >= self.max_len(self.encoder_output)
                 or pred_tokens.shape[0] >= self.streaming_config.max_consecutive_writes
             ):
+                debug('break max_consecutive_writes', prob, source_finished)
                 break
 
             pred_tokens = updated_tokens
@@ -212,7 +221,6 @@ class StreamingDecoder(StreamingAgent):
         if (pred_tokens.shape[0] - initial_tokens_len) == 0 and not finished:
             return
 
-        self.task.inference.cleanup_caching()
         newly_pred_tokens = pred_tokens.tolist()[initial_tokens_len:]
         self.target_sequence += newly_pred_tokens
 
