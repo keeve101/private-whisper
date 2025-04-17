@@ -13,7 +13,7 @@ from .audio import CHUNK_LENGTH, FRAMES_PER_SECOND, HOP_LENGTH, N_FRAMES, load_a
 if TYPE_CHECKING:
     from .model import WhisperStreaming
 
-DEBUG = False
+DEBUG = True
 
 def debug(*args, **kwargs):
     if DEBUG:
@@ -40,6 +40,9 @@ class StreamingAgent(ABC):
     @abstractmethod
     def process_iter(self, input: Any, source_finished: bool) -> Optional[Any]:
         pass
+    
+    def cleanup(self):
+        pass
 
     def process(self, inputs: Iterator) -> Iterator:
         try:
@@ -57,6 +60,8 @@ class StreamingAgent(ABC):
                 val = next_val
         except StopIteration:
             debug('STOP ITER', self)
+        finally:
+            self.cleanup()
 
 
 class StreamingAudioFeatureExtractor(StreamingAgent):
@@ -166,6 +171,9 @@ class StreamingDecoder(StreamingAgent):
         pred_indices: List[int],
     ) -> str:
         return self.task.tokenizer.decode(pred_indices)
+    
+    def cleanup(self):
+        self.task.inference.cleanup_caching()
 
     def process_iter(self, input: Tensor, source_finished: bool) -> Optional[str]:
         debug('READ')
