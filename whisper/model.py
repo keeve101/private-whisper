@@ -92,24 +92,6 @@ class MultiHeadAttention(nn.Module):
         self.key = Linear(n_state, n_state, bias=False)
         self.value = Linear(n_state, n_state)
         self.out = Linear(n_state, n_state)
-        
-    def _monotonic_alignment(self, p):
-        prior_size = p.size()
-        p = p.flatten(0, 1) # b, t, s
-        bsz, tgt_len, src_len = p.size()
-        
-        p_ext = p.roll(1, [-1]).unsqueeze(-2).expand(-1, -1, src_len, -1).triu(1) # B, T, S, S
-        
-        T = (1 - p_ext).cumprod(-1).triu() # B, T, S, S
-        
-        alpha = [p[:, 0] * T[:, 0, 0]]  # First time step: [B, S]
-        
-        for i in range(1, tgt_len):
-            alpha.append(p[:, i, :] * torch.bmm(alpha[i - 1].unsqueeze(1), T[:, i]).squeeze(1))
-        
-        # convert back to b, num_head, t, s
-        return torch.reshape(torch.stack(alpha, dim=1), prior_size)
-        
 
     def forward(
         self,
@@ -118,7 +100,7 @@ class MultiHeadAttention(nn.Module):
         mask: Optional[Tensor] = None,
         kv_cache: Optional[dict] = None,
         training: bool = False,
-        p_choose: Optional[Tensor] = None,
+        alpha: Optional[Tensor] = None,
         monotonic_energy: Optional[Tensor] = None,
         is_cross_attn: bool = False,
         beta_weight: Optional[Tensor] = 0.0,
@@ -137,9 +119,7 @@ class MultiHeadAttention(nn.Module):
             
         wv, qk = self.qkv_attention(q, k, v, mask)
 
-        if training and p_choose is not None and monotonic_energy is not None and is_cross_attn:
-            alpha = self._monotonic_alignment(p_choose) # [B, H, T_q, T_k]
-            
+        if training and alpha is not None and monotonic_energy is not None and is_cross_attn:
             cumprod_energy = torch.cumprod(monotonic_energy, dim=-1) + 1e-8 # to prevent div by zero
             inv_cumprod_energy = 1.0 / cumprod_energy
             
@@ -317,13 +297,38 @@ class PChooseLayer(nn.Module):
             ceil_mode=True,
         )
 
+    def _monotonic_alignment(self, p):
+        prior_size = p.size()
+        p = p.flatten(0, 1) # b, t, s
+        bsz, tgt_len, src_len = p.size()
+
+        p_ext = p.roll(1, [-1]).unsqueeze(-2).expand(-1, -1, src_len, -1).triu(1) # B, T, S, S
+
+        T = (1 - p_ext).cumprod(-1).triu() # B, T, S, S
+
+        alpha = [p[:, 0] * T[:, 0, 0]]  # First time step: [B, S]
+
+        for i in range(1, tgt_len):
+            alpha.append(p[:, i, :] * torch.bmm(alpha[i - 1].unsqueeze(1), T[:, i]).squeeze(1))
+
+        # convert back to b, num_head, t, s
+        return torch.reshape(torch.stack(alpha, dim=1), prior_size)
+
     def forward(self, seqs: Tensor, keys: Tensor) -> Tensor:
         q = self.q_energy_proj(seqs)
 
         # (N, S, M) -> (N, H, S, K)
         q = q.unflatten(-1, (self.num_heads, -1)).transpose(1, 2)
 
-        k = self.k_energy_proj(keys)
+        # (N, S_kv, M) -> (N, M, S_kv) -> (N, M, S_p)
+        pooled_keys = self.keys_pooling(keys.transpose(1, 2))
+
+        # (N, M, S_p) -> (N, S_p, M)
+        pooled_keys = pooled_keys.transpose(1, 2)
+
+        k = self.k_energy_proj(pooled_keys)
+
+        #k = self.k_energy_proj(keys)
 
         # (N, S_p, M) -> (N, H, S_p, K)
         k = k.unflatten(-1, (self.num_heads, -1)).transpose(1, 2)
@@ -341,8 +346,7 @@ class PChooseLayer(nn.Module):
         # p_choose: (N, H, S, S_p)
         p_choose = torch.sigmoid(monotonic_energy / self.monotonic_temperature)
 
-        return p_choose
-
+        return p_choose, self._monotonic_alignment(p_choose)
 
 class MonotonicResidualAttentionBlock(nn.Module):
     def __init__(
@@ -381,10 +385,10 @@ class MonotonicResidualAttentionBlock(nn.Module):
         training: bool = False,
         ):
         x_norm = self.cross_attn_ln(x)
-        p_choose = self.p_choose_layer(x_norm, xa) # parallel to MonotonicTransformerDecoderLayer class
-        x = x + self.cross_attn(x_norm, xa, kv_cache=kv_cache, training=training, p_choose=p_choose, monotonic_energy=self.p_choose_layer.monotonic_energy, is_cross_attn=True)[0]
+        p_choose, alpha = self.p_choose_layer(x_norm, xa) # parallel to MonotonicTransformerDecoderLayer class
+        x = x + self.cross_attn(x_norm, xa, kv_cache=kv_cache, training=training, alpha=alpha, monotonic_energy=self.p_choose_layer.monotonic_energy, is_cross_attn=True)[0]
         
-        return x, p_choose
+        return x, p_choose, alpha
 
     def forward(
         self,
@@ -396,7 +400,8 @@ class MonotonicResidualAttentionBlock(nn.Module):
     ):
         x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
 
-        x, p_choose = self._cross_attn_forward(x, xa, mask, kv_cache, training)
+        x, p_choose, alpha = self._cross_attn_forward(x, xa, mask, kv_cache, training)
+        self.alpha = alpha
 
         x = x + self.mlp(self.mlp_ln(x))
 
@@ -533,7 +538,7 @@ class MonotonicTextDecoder(nn.Module):
         return logits, p_choose
 
     def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None, training: bool = False):
-        self.decode_with_pchoose(x, xa, kv_cache, training)[0]
+        return self.decode_with_pchoose(x, xa, kv_cache, training)
 
 
 class Whisper(nn.Module):
