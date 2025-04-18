@@ -103,7 +103,7 @@ class MultiHeadAttention(nn.Module):
         alpha: Optional[Tensor] = None,
         monotonic_energy: Optional[Tensor] = None,
         is_cross_attn: bool = False,
-        beta_weight: Optional[Tensor] = 0.0,
+        beta_weight: Optional[float] = 0.0,
     ):
         q = self.query(x)
 
@@ -141,7 +141,7 @@ class MultiHeadAttention(nn.Module):
             
             beta_attention = torch.matmul(beta, v).permute(0, 2, 1, 3).flatten(start_dim=2)
             
-            wv = wv + beta_attention * beta_weight
+            wv = (1 - beta_weight) * wv + beta_attention * beta_weight
 
         return self.out(wv), qk
 
@@ -357,6 +357,7 @@ class MonotonicResidualAttentionBlock(nn.Module):
     ):
         super().__init__()
 
+        self.beta_weight = 0.0
         self.attn = MultiHeadAttention(n_state, n_head)
         self.attn_ln = LayerNorm(n_state)
         
@@ -386,7 +387,7 @@ class MonotonicResidualAttentionBlock(nn.Module):
         ):
         x_norm = self.cross_attn_ln(x)
         p_choose, alpha = self.p_choose_layer(x_norm, xa) # parallel to MonotonicTransformerDecoderLayer class
-        x = x + self.cross_attn(x_norm, xa, kv_cache=kv_cache, training=training, alpha=alpha, monotonic_energy=self.p_choose_layer.monotonic_energy, is_cross_attn=True)[0]
+        x = x + self.cross_attn(x_norm, xa, kv_cache=kv_cache, training=training, alpha=alpha, monotonic_energy=self.p_choose_layer.monotonic_energy, is_cross_attn=True, beta_weight=self.beta_weight)[0]
         
         return x, p_choose, alpha
 

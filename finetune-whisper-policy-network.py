@@ -93,7 +93,7 @@ optimizer = torch.optim.AdamW(
 lr_scheduler = get_scheduler(
     name="linear",
     optimizer=optimizer,
-    num_warmup_steps=200,
+    num_warmup_steps=50,
     num_training_steps=num_steps
 )
 
@@ -107,7 +107,7 @@ for batch_idx, batch in enumerate(train_data_loader):
         y_in = batch["Y_in"][idx]
         y_out = batch["Y_out"][idx]
         
-        logits, p_choose = model.decoder(y_in, mel, training=False)
+        logits, p_choose = model.decoder(y_in, mel, training=True)
         
         loss = F.cross_entropy(logits.transpose(1, 2), y_out)
         
@@ -127,6 +127,11 @@ for batch_idx, batch in enumerate(train_data_loader):
         
         current_lr = lr_scheduler.get_last_lr()[0]
         step = batch_idx * batch_size + idx
+        
+        beta_weight = min(1.0, step / num_steps)
+        for block in model.decoder.blocks:
+            block.beta_weight = beta_weight
+
         print(f"Step {step}: loss = {loss.item():.4f}, lr = {current_lr:.6e}")
         
         del logits, p_choose, alphas, alpha
