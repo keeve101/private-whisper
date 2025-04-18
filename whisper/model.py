@@ -92,6 +92,24 @@ class MultiHeadAttention(nn.Module):
         self.key = Linear(n_state, n_state, bias=False)
         self.value = Linear(n_state, n_state)
         self.out = Linear(n_state, n_state)
+        
+    def _monotonic_alignment(self, p):
+        prior_size = p.size()
+        p = p.flatten(0, 1) # b, t, s
+        bsz, tgt_len, src_len = p.size()
+        
+        p_ext = p.roll(1, [-1]).unsqueeze(-2).expand(-1, -1, src_len, -1).triu(1) # B, T, S, S
+        
+        T = (1 - p_ext).cumprod(-1).triu() # B, T, S, S
+        
+        alpha = [p[:, 0] * T[:, 0, 0]]  # First time step: [B, S]
+        
+        for i in range(1, tgt_len):
+            alpha.append(p[:, i, :] * torch.bmm(alpha[i - 1].unsqueeze(1), T[:, i]).squeeze(1))
+        
+        # convert back to b, num_head, t, s
+        return torch.reshape(torch.stack(alpha, dim=1), prior_size)
+        
 
     def forward(
         self,
@@ -99,6 +117,11 @@ class MultiHeadAttention(nn.Module):
         xa: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
         kv_cache: Optional[dict] = None,
+        training: bool = False,
+        p_choose: Optional[Tensor] = None,
+        monotonic_energy: Optional[Tensor] = None,
+        is_cross_attn: bool = False,
+        beta_weight: Optional[Tensor] = 0.0,
     ):
         q = self.query(x)
 
@@ -111,8 +134,35 @@ class MultiHeadAttention(nn.Module):
             # for cross-attention, calculate keys and values once and reuse in subsequent calls.
             k = kv_cache[self.key]
             v = kv_cache[self.value]
-
+            
         wv, qk = self.qkv_attention(q, k, v, mask)
+
+        if training and p_choose is not None and monotonic_energy is not None and is_cross_attn:
+            alpha = self._monotonic_alignment(p_choose) # [B, H, T_q, T_k]
+            
+            cumprod_energy = torch.cumprod(monotonic_energy, dim=-1) + 1e-8 # to prevent div by zero
+            inv_cumprod_energy = 1.0 / cumprod_energy
+            
+            inner = alpha * inv_cumprod_energy
+            
+            flipped = torch.flip(inner, dims=[-1])
+            
+            cumsum = torch.cumsum(flipped, dim=-1)
+            
+            flipped_cumsum = torch.flip(cumsum, dims=[-1])
+            
+            beta = monotonic_energy * flipped_cumsum
+            
+            # now we apply beta as soft-attention weights over V
+            bsz, T_k, model_dim = v.shape
+            D_head =  model_dim // self.n_head
+            
+            v = v.view(bsz, T_k, self.n_head, D_head).permute(0, 2, 1, 3)
+            
+            beta_attention = torch.matmul(beta, v).permute(0, 2, 1, 3).flatten(start_dim=2)
+            
+            wv = wv + beta_attention * beta_weight
+
         return self.out(wv), qk
 
     def qkv_attention(
@@ -273,13 +323,7 @@ class PChooseLayer(nn.Module):
         # (N, S, M) -> (N, H, S, K)
         q = q.unflatten(-1, (self.num_heads, -1)).transpose(1, 2)
 
-        # (N, S_kv, M) -> (N, M, S_kv) -> (N, M, S_p)
-        pooled_keys = self.keys_pooling(keys.transpose(1, 2))
-
-        # (N, M, S_p) -> (N, S_p, M)
-        pooled_keys = pooled_keys.transpose(1, 2)
-
-        k = self.k_energy_proj(pooled_keys)
+        k = self.k_energy_proj(keys)
 
         # (N, S_p, M) -> (N, H, S_p, K)
         k = k.unflatten(-1, (self.num_heads, -1)).transpose(1, 2)
@@ -291,6 +335,8 @@ class PChooseLayer(nn.Module):
 
         if self.energy_bias is not None:
             monotonic_energy += self.energy_bias.to(seqs.dtype)
+            
+        self.monotonic_energy = monotonic_energy # save for later use, N, H, S, S_p
 
         # p_choose: (N, H, S, S_p)
         p_choose = torch.sigmoid(monotonic_energy / self.monotonic_temperature)
@@ -309,7 +355,14 @@ class MonotonicResidualAttentionBlock(nn.Module):
 
         self.attn = MultiHeadAttention(n_state, n_head)
         self.attn_ln = LayerNorm(n_state)
-
+        
+        # p_choose layer shall 
+        self.p_choose_layer = PChooseLayer(
+            n_state,
+            n_head,
+            streaming_config,
+        )
+        
         self.cross_attn = MultiHeadAttention(n_state, n_head)
         self.cross_attn_ln = LayerNorm(n_state)
 
@@ -318,12 +371,20 @@ class MonotonicResidualAttentionBlock(nn.Module):
             Linear(n_state, n_mlp), nn.GELU(), Linear(n_mlp, n_state)
         )
         self.mlp_ln = LayerNorm(n_state)
-
-        self.p_choose_layer = PChooseLayer(
-            n_state,
-            n_head,
-            streaming_config,
-        )
+    
+    def _cross_attn_forward(
+        self,
+        x: Tensor,
+        xa: Optional[Tensor] = None,
+        mask: Optional[Tensor] = None,
+        kv_cache: Optional[dict] = None,
+        training: bool = False,
+        ):
+        x_norm = self.cross_attn_ln(x)
+        p_choose = self.p_choose_layer(x_norm, xa) # parallel to MonotonicTransformerDecoderLayer class
+        x = x + self.cross_attn(x_norm, xa, kv_cache=kv_cache, training=training, p_choose=p_choose, monotonic_energy=self.p_choose_layer.monotonic_energy, is_cross_attn=True)[0]
+        
+        return x, p_choose
 
     def forward(
         self,
@@ -331,12 +392,11 @@ class MonotonicResidualAttentionBlock(nn.Module):
         xa: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
         kv_cache: Optional[dict] = None,
+        training: bool = False,
     ):
         x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
 
-        x_norm = self.cross_attn_ln(x)
-        p_choose = self.p_choose_layer(x_norm, xa)
-        x = x + self.cross_attn(x_norm, xa, kv_cache=kv_cache)[0]
+        x, p_choose = self._cross_attn_forward(x, xa, mask, kv_cache, training)
 
         x = x + self.mlp(self.mlp_ln(x))
 
@@ -442,7 +502,7 @@ class MonotonicTextDecoder(nn.Module):
         mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
-    def decode_with_pchoose(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
+    def decode_with_pchoose(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None, training: bool = False):
         """
         x : torch.LongTensor, shape = (batch_size, <= n_ctx)
             the text tokens
@@ -459,7 +519,7 @@ class MonotonicTextDecoder(nn.Module):
         p_choose_list: List[Tensor] = []
 
         for block in self.blocks:
-            x, p_choose = block(x, xa, mask=self.mask, kv_cache=kv_cache)
+            x, p_choose = block(x, xa, mask=self.mask, kv_cache=kv_cache, training=training)
             p_choose_list.append(p_choose)
 
         x = self.ln(x)
@@ -472,8 +532,8 @@ class MonotonicTextDecoder(nn.Module):
 
         return logits, p_choose
 
-    def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
-        self.decode_with_pchoose(x, xa, kv_cache)[0]
+    def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None, training: bool = False):
+        self.decode_with_pchoose(x, xa, kv_cache, training)[0]
 
 
 class Whisper(nn.Module):
