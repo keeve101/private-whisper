@@ -314,7 +314,7 @@ class PChooseLayer(nn.Module):
         # convert back to b, num_head, t, s
         return torch.reshape(torch.stack(alpha, dim=1), prior_size)
 
-    def forward(self, seqs: Tensor, keys: Tensor) -> Tensor:
+    def forward(self, seqs: Tensor, keys: Tensor, training: bool = False) -> Tensor:
         q = self.q_energy_proj(seqs)
 
         # (N, S, M) -> (N, H, S, K)
@@ -345,8 +345,10 @@ class PChooseLayer(nn.Module):
 
         # p_choose: (N, H, S, S_p)
         p_choose = torch.sigmoid(monotonic_energy / self.monotonic_temperature)
-
-        return p_choose, self._monotonic_alignment(p_choose)
+        
+        monotonic_alignment = None if not training else self._monotonic_alignment(p_choose)
+        
+        return p_choose, monotonic_alignment
 
 class MonotonicResidualAttentionBlock(nn.Module):
     def __init__(
@@ -385,7 +387,7 @@ class MonotonicResidualAttentionBlock(nn.Module):
         training: bool = False,
         ):
         x_norm = self.cross_attn_ln(x)
-        p_choose, alpha = self.p_choose_layer(x_norm, xa) # parallel to MonotonicTransformerDecoderLayer class
+        p_choose, alpha = self.p_choose_layer(x_norm, xa, training) # parallel to MonotonicTransformerDecoderLayer class
         x = x + self.cross_attn(x_norm, xa, kv_cache=kv_cache, training=training, alpha=alpha, monotonic_energy=self.p_choose_layer.monotonic_energy, is_cross_attn=True)[0]
         
         return x, p_choose, alpha
@@ -718,3 +720,4 @@ class WhisperStreaming(Whisper):
     transcribe = transcribe_function
     decode = decode_function
     transcribe_stream = transcribe_stream_function
+
