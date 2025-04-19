@@ -4,6 +4,8 @@ from torch.utils.data import DataLoader
 
 import gc
 
+import os
+
 import whisper
 from whisper.streaming import StreamingConfig
 from whisper.tokenizer import get_tokenizer
@@ -82,8 +84,8 @@ batch_size = 1
 #train_data_loader = load_training_dataset(batch_size=batch_size, filter_func=filter_by_length)
 train_data_loader = load_training_dataset(batch_size=batch_size, filter_func=lambda x: x)
 
-lr = 1.5e-3 
-num_steps = 100
+lr = 1.5e-3 / 10
+num_steps = 300
 
 optimizer = torch.optim.AdamW(
     filter(lambda p: p.requires_grad, model.parameters()), 
@@ -96,6 +98,9 @@ lr_scheduler = get_scheduler(
     num_warmup_steps=50,
     num_training_steps=num_steps
 )
+
+output_dir = os.path.join(os.getcwd(), "outputs")
+os.makedirs(output_dir, exist_ok=True)
 
 lambda_latency = 0.01 # the lower the number the more the model will be sensitive to the timing of the audio
 lambda_variance = 0.01
@@ -128,7 +133,7 @@ for batch_idx, batch in enumerate(train_data_loader):
         current_lr = lr_scheduler.get_last_lr()[0]
         step = batch_idx * batch_size + idx
         
-        beta_weight = min(1.0, step / num_steps)
+        beta_weight = min(0.5, step / num_steps)
         for block in model.decoder.blocks:
             block.beta_weight = beta_weight
 
@@ -137,10 +142,11 @@ for batch_idx, batch in enumerate(train_data_loader):
         del logits, p_choose, alphas, alpha
         gc.collect()
         torch.cuda.empty_cache()
+    
+    if step % 50 == 0:
+        save_path = output_dir +  f"whisper_streaming_pchoose_{step}.pt"
+        torch.save(model.state_dict(), save_path)
+        print(f"Model saved to {save_path}")
 
     if batch_idx >= num_steps:
         break
-    
-save_path = "whisper_streaming_pchoose.pt"
-torch.save(model.state_dict(), save_path)
-print(f"Model saved to {save_path}")
