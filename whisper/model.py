@@ -14,7 +14,7 @@ from typing import Optional, final
 
 from .decoding import decode as decode_function
 from .decoding import detect_language as detect_language_function
-from .streaming import StreamingConfig, transcribe_stream as transcribe_stream_function
+from .streaming import StreamingConfig
 from .transcribe import transcribe as transcribe_function
 
 try:
@@ -719,5 +719,4 @@ class WhisperStreaming(Whisper):
     detect_language = detect_language_function
     transcribe = transcribe_function
     decode = decode_function
-    transcribe_stream = transcribe_stream_function
 

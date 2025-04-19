@@ -1,23 +1,13 @@
-import numpy as np
 import torch
+import logging
 
-from abc import ABC, abstractmethod
-from torch import Tensor
-from typing import TYPE_CHECKING, Any, Iterator, Optional, List, Tuple, Union
-from dataclasses import replace, dataclass
-import torch.nn.functional as F
+from whisper.tokenizer import get_tokenizer
 
-from .decoding import DecodingOptions, DecodingTask, MonotonicPyTorchInference
-from .audio import CHUNK_LENGTH, FRAMES_PER_SECOND, HOP_LENGTH, N_FRAMES, load_audio, log_mel_spectrogram, pad_or_trim
+logger = logging.getLogger("__main__")
 
-if TYPE_CHECKING:
-    from .model import WhisperStreaming
+from dataclasses import dataclass
 
-DEBUG = True
-
-def debug(*args, **kwargs):
-    if DEBUG:
-        print(*args, **kwargs)
+from .audio import log_mel_spectrogram, pad_or_trim
 
 @dataclass
 class StreamingConfig:
@@ -35,257 +25,117 @@ class StreamingConfig:
     max_consecutive_writes = 50
     no_early_stop = False
 
+# Simulate a streaming audio source
+def chunk_audio(audio_tensor, chunk_size):
+    for i in range(0, len(audio_tensor), chunk_size):
+        yield audio_tensor[i:i+chunk_size]
 
-class StreamingAgent(ABC):
-    @abstractmethod
-    def process_iter(self, input: Any, source_finished: bool) -> Optional[Any]:
-        pass
+
+def run_streaming_inference(model, audio, device='auto', threshold_probability = 0.17):
     
-    def cleanup(self):
-        pass
+    chunk_size = 16000  # 1 second chunks at 16kHz
+    stream = chunk_audio(audio, chunk_size)
 
-    def process(self, inputs: Iterator) -> Iterator:
-        try:
-            val = next(inputs)
-            while val is not Ellipsis:
-                try:
-                    next_val = next(inputs)
-                except StopIteration:
-                    next_val = Ellipsis
+    tokenizer = get_tokenizer(multilingual=False)
 
-                o = self.process_iter(val, next_val is Ellipsis)
-                if o is not None:
-                    yield o
+    decoder_input = list(tokenizer.sot_sequence_including_notimestamps)
+    audio_accum = torch.tensor([], device=device)
+    stall_count = 0
+    max_stall_chunks = 3
+    all_emitted = []
+    emitted_chunks = []
 
-                val = next_val
-        except StopIteration:
-            debug('STOP ITER', self)
-        finally:
-            self.cleanup()
+    for j, audio_chunk in enumerate(stream, start=1):
+        logger.debug(f"--- Chunk {j} ---")
 
+        emitted_len = len(all_emitted)
 
-class StreamingAudioFeatureExtractor(StreamingAgent):
-    """
-    Streaming audio feature extractor that processes audio chunks and extracts Mel spectrograms.
-    """
-    def __init__(self, n_mels: int = 80, chunk_size: int = HOP_LENGTH, device: Optional[Union[str, torch.device]] = None):
-        self.n_mels = n_mels
-        self.device = device
-        self.chunk_size = chunk_size
-        self.previous_residual_samples = np.array([], dtype=np.float32)
+        audio_chunk = torch.tensor(audio_chunk, device=device)
+        audio_accum = torch.cat([audio_accum, audio_chunk])
 
-    def process_iter(self, input: np.ndarray, source_finished: bool) -> Optional[Tensor]:
-        """
-        Process streaming audio and yield log-Mel spectrogram chunks.
-        Returns (n_mels, n_frames)
-        """
-        samples = np.concatenate((self.previous_residual_samples, input))
-        if len(samples) < self.chunk_size and not source_finished:
-            self.previous_residual_samples = samples
-            return
-        
-        input_samples = samples[:self.chunk_size]
-        self.previous_residual_samples = samples[self.chunk_size:]
+        padded_audio = pad_or_trim(audio_accum)
+        mel_input = log_mel_spectrogram(padded_audio.to(torch.float32)).unsqueeze(0)
 
-        log_mel_spec = log_mel_spectrogram(input_samples, self.n_mels, device=self.device)
+        with torch.no_grad():
+            h_j = model.encoder(mel_input)
 
-        debug("log mel yield")
-        return log_mel_spec
+        emitted = False
+        while True:
+            with torch.no_grad():
+                y_in = torch.tensor([decoder_input], device=device)
+                logits, p_choose = model.decoder(y_in, h_j)
 
-class OfflineAudioEncoder(StreamingAgent):
-    def __init__(self, model: "WhisperStreaming", min_length: int = 1, max_length: int = CHUNK_LENGTH-1) -> None:
-        self.model = model
-        self.mels: Optional[Tensor] = None
-        self.min_frames = min_length*FRAMES_PER_SECOND
-        self.max_frames = max_length*FRAMES_PER_SECOND
+                if p_choose.ndim == 3:
+                    _, tgt_len, src_len = p_choose.size()
+                    p_choose = p_choose.view(model.dims.n_text_layer, -1, tgt_len, src_len)
 
-    def process_iter(self, input: Tensor, source_finished: bool) -> Optional[Tensor]:
-        """
-        Process streaming mels and yields encoder output
-        Returns (VEC_SIZE, n_frames)
-        """
-        if self.mels is None:
-            self.mels = input
-        else:
-            self.mels = torch.cat((self.mels, input), dim=1)
-            self.mels = self.mels[:, -self.max_frames:]
+                p = p_choose[:, :, -1, :].mean().item()
 
-        if self.mels.shape[1] < self.min_frames and not source_finished:
-            return
+            logger.debug(f"Policy probability p = {p:.3f}")
 
-        input_mels = pad_or_trim(self.mels.unsqueeze(0), length=N_FRAMES)
-        # input_mels = F.pad(self.mels.unsqueeze(0), (0, 3000 - self.mels.shape[-1]))
+            if p < threshold_probability and stall_count < max_stall_chunks:
+                logger.debug("⚠️ Stalling...")
+                stall_count += 1
+                break  # wait for more audio in next chunk
+            elif p < threshold_probability:
+                next_token = logits[:, -1].argmax(dim=-1).item()
+                decoder_input.append(next_token)
+            
+                if next_token not in {tokenizer.eot, tokenizer.sot}:
+                    all_emitted.append(next_token)
 
-        debug("encoder len", self.mels.shape)
+                logger.debug("Decoded so far:", tokenizer.decode(decoder_input))
+                break
 
-        return self.model.embed_audio(input_mels)
+            emitted = True
+            next_token = logits[:, -1].argmax(dim=-1).item()
+            decoder_input.append(next_token)
+            
+            if next_token not in {tokenizer.eot, tokenizer.sot}:
+                all_emitted.append(next_token)
 
-class StreamingDecoder(StreamingAgent):
-    def __init__(self, model: "WhisperStreaming", streaming_config: StreamingConfig,
-                 decoding_options: "DecodingOptions", device: Optional[Union[str, torch.device]] = None) -> None:
-        self.model = model
-        self.streaming_config = streaming_config
-        self.task = DecodingTask(model, decoding_options, inference_cls=MonotonicPyTorchInference)
-        self.target_sequence: List[int] = []
-        self.encoder_output: Tensor = Tensor()
-        self.device = device
+            logger.debug("Decoded so far:", tokenizer.decode(decoder_input))
 
-    def max_len(self, src):
-        return self.streaming_config.max_len_a*src.shape[1] + self.streaming_config.max_len_b
+            if next_token == tokenizer.eot:
+                logger.debug("🛑 End of segment")
+                decoder_input = list(tokenizer.sot_sequence_including_notimestamps)
+                audio_accum = torch.tensor([], device=device)
+                stall_count = 0
+                break
 
-    def run_decoder(
-        self, tokens: Tensor,
-    ) -> Tuple[Tensor, bool, float, Tensor]:
-        debug(self.task.tokenizer.decode(tokens.tolist()))
-        tokens = tokens.unsqueeze(0)
+        emitted_chunks.append(tokenizer.decode(all_emitted[emitted_len:]))
+        if emitted:
+            stall_count = 0
 
-        logits, p_choose = self.task.inference.decode_with_pchoose(tokens, self.encoder_output)
+    # After stream ends, flush remaining audio if any
+    if len(audio_accum) > 0:
+        emitted_len = len(all_emitted)
+        logger.debug("🚨 Final flush after last chunk")
 
-        # now we need to consider the logits at the last token only
-        logits = logits[:, -1]
+        padded_audio = pad_or_trim(audio_accum)
+        mel_input = log_mel_spectrogram(padded_audio.to(torch.float32)).unsqueeze(0)
 
-        # apply the logit filters, e.g. for suppressing or applying penalty to
-        for logit_filter in self.task.logit_filters:
-            logit_filter.apply(logits, tokens)
-
-        # expand the tokens tensor with the selected next tokens
-        n_batch = tokens.shape[0]
-        sum_logprobs: Tensor = torch.zeros(n_batch, device=tokens.device)
-        updated_tokens, reached_eos = self.task.decoder.update(tokens, logits, sum_logprobs)
-
-        _, tgt_len, src_len = p_choose.size()
-
-        p_choose = p_choose.view(self.model.dims.n_text_layer, -1, tgt_len, src_len)
-
-        if self.streaming_config.decision_method == "min":
-            prob = p_choose[self.streaming_config.p_choose_start_layer :, :, -1, -1].min().item()
-        elif self.streaming_config.decision_method == "mean":
-            prob = p_choose[self.streaming_config.p_choose_start_layer :, :, -1, -1].mean().item()
-        else:
-            prob = p_choose[self.streaming_config.p_choose_start_layer :, :, -1, -1].median().item()
-
-        return updated_tokens[0], reached_eos, prob, logits
-
-    def postprocess(
-        self,
-        pred_indices: List[int],
-    ) -> str:
-        return self.task.tokenizer.decode(pred_indices)
-    
-    def cleanup(self):
-        self.task.inference.cleanup_caching()
-
-    def process_iter(self, input: Tensor, source_finished: bool) -> Optional[str]:
-        debug('READ')
-        self.encoder_output = input
-        initial_tokens_len = len(self.task.initial_tokens)
-        pred_tokens: Tensor = torch.tensor(list(self.task.initial_tokens) + self.target_sequence, device=self.device)
-        finished = False
-        decoder_features_out = None
-
-        self.task.decoder.reset()
-        self.task.inference.cleanup_caching()
+        with torch.no_grad():
+            h_j = model.encoder(mel_input)
 
         while True:
-            updated_tokens, reached_eos, prob, decoder_features = self.run_decoder(pred_tokens)
+            with torch.no_grad():
+                y_in = torch.tensor([decoder_input], device=device)
+                logits, _ = model.decoder(y_in, h_j)
 
-            if decoder_features_out is None:
-                decoder_features_out = decoder_features.new(0)
-            decoder_features_out = torch.cat(
-                [decoder_features_out, decoder_features], dim=1
-            )
+            next_token = logits[:, -1].argmax(dim=-1).item()
+            decoder_input.append(next_token)
 
-            if (
-                self.streaming_config.no_early_stop
-                and not source_finished
-                and (prob < self.streaming_config.decision_threshold or reached_eos)
-            ):
-                if prob == 1.0:
-                    pred_tokens = torch.tensor(self.task.initial_tokens)
-                debug('break early stop?', self.streaming_config.no_early_stop, source_finished, prob, reached_eos)
+            if next_token not in {tokenizer.eot, tokenizer.sot, tokenizer.no_timestamps}:
+                all_emitted.append(next_token)
+
+            logger.debug("Decoded so far:", tokenizer.decode(decoder_input))
+
+            if next_token == tokenizer.eot:
+                logger.debug("🛑 Final end of segment")
                 break
 
-            if (
-                finished or reached_eos
-                or len(self.target_sequence) + pred_tokens.shape[0] > self.max_len(self.encoder_output)
-            ):
-                debug('break finished', finished, reached_eos)
-                finished = True
-                break
+        emitted_chunks.append(tokenizer.decode(all_emitted[emitted_len:]))
 
-            if prob < self.streaming_config.decision_threshold and not source_finished:
-                debug('break read', prob, source_finished)
-                break
-
-            if (
-                len(self.target_sequence) + pred_tokens.shape[0] >= self.max_len(self.encoder_output)
-                or pred_tokens.shape[0] >= self.streaming_config.max_consecutive_writes
-            ):
-                debug('break max_consecutive_writes', prob, source_finished)
-                break
-
-            pred_tokens = updated_tokens
-
-        if (pred_tokens.shape[0] - initial_tokens_len) == 0 and not finished:
-            return
-
-        newly_pred_tokens = pred_tokens.tolist()[initial_tokens_len:]
-        self.target_sequence += newly_pred_tokens
-
-        r = self.postprocess(newly_pred_tokens)
-        debug('WRITE', r)
-        return r
-
-class SpeechToTextPipeline:
-    def __init__(self, model, streaming_config: StreamingConfig, decoding_options: "DecodingOptions",
-                 n_mels=80, chunk_size=HOP_LENGTH,
-                 min_length=1, max_length=CHUNK_LENGTH-1,
-                 device: Optional[Union[str, torch.device]] = None) -> None:
-        self.device = device
-        self.pipeline = [
-            StreamingAudioFeatureExtractor(n_mels=n_mels, chunk_size=chunk_size, device=device),
-            OfflineAudioEncoder(model, min_length=min_length, max_length=max_length),
-            StreamingDecoder(model, streaming_config=streaming_config,
-                             decoding_options=decoding_options, device=device)
-        ]
-
-    def process(self, inputs: Iterator) -> Iterator:
-        for part in self.pipeline:
-            inputs = part.process(inputs)
-        return inputs
-
-class AudioStreamSource:
-    def __init__(self, audio: Union[np.ndarray, str], chunk_size: int) -> None:
-        if isinstance(audio, str):
-            audio = load_audio(audio).astype(np.float32)
-
-        self.audio = audio
-        self.chunk_size = chunk_size
-
-    def generate(self):
-        for i in range(0, len(self.audio), self.chunk_size):
-            debug("stream source yield")
-            yield self.audio[i:i+self.chunk_size]
-
-
-def transcribe_stream(
-    model: "WhisperStreaming",
-    audio: Union[str, np.ndarray],
-    decoding_options: DecodingOptions = DecodingOptions(),
-    streaming_options: StreamingConfig = StreamingConfig(),
-    min_length=1, max_length=CHUNK_LENGTH-1, chunk_size=10*HOP_LENGTH,
-    **kwargs,
-) -> str:
-    if kwargs:
-        decoding_options = replace(decoding_options, **kwargs)
-        streaming_options = replace(streaming_options, **kwargs)
-
-    source = AudioStreamSource(audio, chunk_size)
-
-    pipeline = SpeechToTextPipeline(model, streaming_options, decoding_options,
-                                    n_mels=model.dims.n_mels,
-                                    chunk_size=chunk_size, min_length=min_length,
-                                    max_length=max_length, device=model.device)
-    outputs = pipeline.process(source.generate())
-
-    return "".join(outputs)
+    # Final output
+    return emitted_chunks
