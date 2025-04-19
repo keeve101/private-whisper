@@ -320,15 +320,7 @@ class PChooseLayer(nn.Module):
         # (N, S, M) -> (N, H, S, K)
         q = q.unflatten(-1, (self.num_heads, -1)).transpose(1, 2)
 
-        # (N, S_kv, M) -> (N, M, S_kv) -> (N, M, S_p)
-        pooled_keys = self.keys_pooling(keys.transpose(1, 2))
-
-        # (N, M, S_p) -> (N, S_p, M)
-        pooled_keys = pooled_keys.transpose(1, 2)
-
-        k = self.k_energy_proj(pooled_keys)
-
-        #k = self.k_energy_proj(keys)
+        k = self.k_energy_proj(keys)
 
         # (N, S_p, M) -> (N, H, S_p, K)
         k = k.unflatten(-1, (self.num_heads, -1)).transpose(1, 2)

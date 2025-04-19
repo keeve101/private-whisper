@@ -83,7 +83,7 @@ batch_size = 1
 train_data_loader = load_training_dataset(batch_size=batch_size, filter_func=lambda x: x)
 
 lr = 1.5e-3 
-num_steps = 20
+num_steps = 100
 
 optimizer = torch.optim.AdamW(
     filter(lambda p: p.requires_grad, model.parameters()), 
