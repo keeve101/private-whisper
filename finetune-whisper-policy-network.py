@@ -15,8 +15,8 @@ from transformers import get_scheduler
 
 from datasets import load_dataset
 
-dataset_path = "MLCommons/peoples_speech"
-config_name = "clean"
+dataset_path = "mozilla-foundation/common_voice_17_0"
+config_name = "en"
 
 train_split = "train"
 validation_split = "validation"
@@ -69,7 +69,7 @@ def collate_fn(batch):
     with torch.no_grad():
         mels = [model.encoder(mel.unsqueeze(0).detach()) for mel in mels]
     
-    Y = [tokenizer.encode(example['text']) for example in batch]
+    Y = [tokenizer.encode(example['sentence']) for example in batch]
     
     Y_in = torch.tensor([[[tokenizer.sot] + seq] for seq in Y], device=device)
     Y_out = torch.tensor([[seq + [tokenizer.eot]] for seq in Y], device=device)
@@ -84,7 +84,7 @@ batch_size = 1
 #train_data_loader = load_training_dataset(batch_size=batch_size, filter_func=filter_by_length)
 train_data_loader = load_training_dataset(batch_size=batch_size, filter_func=lambda x: x)
 
-lr = 1.5e-3 / 10
+lr = 1.5e-3 / 256
 num_steps = 300
 
 optimizer = torch.optim.AdamW(
@@ -102,8 +102,8 @@ lr_scheduler = get_scheduler(
 output_dir = os.path.join(os.getcwd(), "outputs")
 os.makedirs(output_dir, exist_ok=True)
 
-lambda_latency = 0.01 # the lower the number the more the model will be sensitive to the timing of the audio
-lambda_variance = 0.01
+lambda_latency = 0.1 # the lower the number the more the model will be sensitive to the timing of the audio
+lambda_variance = 0.1
 monotonic_regularization_loss_fn = MonotonicRegularizationLoss(lambda_latency=lambda_latency, lambda_variance=lambda_variance)
 
 for batch_idx, batch in enumerate(train_data_loader):
@@ -114,13 +114,15 @@ for batch_idx, batch in enumerate(train_data_loader):
         
         logits, p_choose = model.decoder(y_in, mel, training=True)
         
-        loss = F.cross_entropy(logits.transpose(1, 2), y_out)
+        ce_loss = F.cross_entropy(logits.transpose(1, 2), y_out)
         
         alphas = [block.alpha for block in model.decoder.blocks]
         
         # average over blocks
         alpha = torch.stack(alphas).mean(0)
-        loss += monotonic_regularization_loss_fn(alpha)
+        
+        reg_loss = monotonic_regularization_loss_fn(alpha)
+        loss = ce_loss + reg_loss
         
         loss.backward()
         
@@ -131,20 +133,23 @@ for batch_idx, batch in enumerate(train_data_loader):
         optimizer.zero_grad()
         
         current_lr = lr_scheduler.get_last_lr()[0]
-        step = batch_idx * batch_size + idx
+        step = batch_idx * batch_size + idx + 1
         
-        beta_weight = min(0.5, step / num_steps)
+        beta_weight = min(0, step / num_steps)
         for block in model.decoder.blocks:
             block.beta_weight = beta_weight
 
-        print(f"Step {step}: loss = {loss.item():.4f}, lr = {current_lr:.6e}")
+        print(f"Step {step}: total = {loss.item():.4f}, CE = {ce_loss.item():.4f}, Reg = {reg_loss.item():.4f}, lr = {current_lr:.6e}")
         
-        del logits, p_choose, alphas, alpha
+        next_token = logits[:, -1].argmax(dim=-1).item()
+        print(tokenizer.decode(y_in.view(-1).tolist() + [next_token]))
+        
+        del logits, p_choose, alphas, alpha, reg_loss, ce_loss
         gc.collect()
         torch.cuda.empty_cache()
     
     if step % 50 == 0:
-        save_path = output_dir +  f"whisper_streaming_pchoose_{step}.pt"
+        save_path = output_dir +  f"/whisper_streaming_pchoose_{step}.pt"
         torch.save(model.state_dict(), save_path)
         print(f"Model saved to {save_path}")
 

@@ -137,9 +137,9 @@ class MultiHeadAttention(nn.Module):
             bsz, T_k, model_dim = v.shape
             D_head =  model_dim // self.n_head
             
-            v = v.view(bsz, T_k, self.n_head, D_head).permute(0, 2, 1, 3)
+            v_permute = v.view(bsz, T_k, self.n_head, D_head).permute(0, 2, 1, 3)
             
-            beta_attention = torch.matmul(beta, v).permute(0, 2, 1, 3).flatten(start_dim=2)
+            beta_attention = torch.matmul(beta, v_permute).permute(0, 2, 1, 3).flatten(start_dim=2)
             
             wv = (1 - beta_weight) * wv + beta_attention * beta_weight
 
