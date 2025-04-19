@@ -31,14 +31,14 @@ model.load_state_dict(whisper_tiny.state_dict(), strict=False)
 del whisper_tiny
 
 for name, param in model.named_parameters():
-    if "p_choose_layer" in name:
+    if "p_choose_layer" in name or "cross_attn.value" in name:
         param.requires_grad = True
     else:
         param.requires_grad = False
         
 # for my sanity
 for name, param in model.named_parameters():
-    if "p_choose_layer" in name:
+    if "p_choose_layer" in name or "cross_attn.value" in name:
         assert param.requires_grad == True
     else:
         assert param.requires_grad == False
@@ -69,7 +69,7 @@ def collate_fn(batch):
     with torch.no_grad():
         mels = [model.encoder(mel.unsqueeze(0).detach()) for mel in mels]
     
-    Y = [tokenizer.encode(example['sentence']) for example in batch]
+    Y = [tokenizer.encode(example['sentence'].strip()) for example in batch]
     
     Y_in = torch.tensor([[[tokenizer.sot] + seq] for seq in Y], device=device)
     Y_out = torch.tensor([[seq + [tokenizer.eot]] for seq in Y], device=device)
@@ -84,12 +84,12 @@ batch_size = 1
 #train_data_loader = load_training_dataset(batch_size=batch_size, filter_func=filter_by_length)
 train_data_loader = load_training_dataset(batch_size=batch_size, filter_func=lambda x: x)
 
-lr = 1.5e-3 / 256
-num_steps = 300
+lr = 1.5e-3 / 40
+num_steps = 1000
 
 optimizer = torch.optim.AdamW(
     filter(lambda p: p.requires_grad, model.parameters()), 
-    lr=lr, betas=(0.9, 0.98), eps=1e-6, weight_decay=0.1
+    lr=lr, betas=(0.9, 0.98), eps=1e-6, weight_decay=0.01
 )
 
 lr_scheduler = get_scheduler(
@@ -102,8 +102,8 @@ lr_scheduler = get_scheduler(
 output_dir = os.path.join(os.getcwd(), "outputs")
 os.makedirs(output_dir, exist_ok=True)
 
-lambda_latency = 0.1 # the lower the number the more the model will be sensitive to the timing of the audio
-lambda_variance = 0.1
+lambda_latency = 0.5 # the lower the number the more the model will be sensitive to the timing of the audio
+lambda_variance = 0.5
 monotonic_regularization_loss_fn = MonotonicRegularizationLoss(lambda_latency=lambda_latency, lambda_variance=lambda_variance)
 
 for batch_idx, batch in enumerate(train_data_loader):
@@ -135,7 +135,7 @@ for batch_idx, batch in enumerate(train_data_loader):
         current_lr = lr_scheduler.get_last_lr()[0]
         step = batch_idx * batch_size + idx + 1
         
-        beta_weight = min(0, step / num_steps)
+        beta_weight = min(0.5, step / num_steps)
         for block in model.decoder.blocks:
             block.beta_weight = beta_weight
 
