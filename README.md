@@ -4,7 +4,25 @@
 - Lee Le Xuan 1006029
 - Luv Singhal 1006250
 
-In this project, we extend Whisper’s text decoder with an EMMA-based framework. we propose a novel EMMA-style modulation mechanism that integrates monotonic attention directly into the cross-attention layers of Whisper, encouraging localized and efficient attention patterns during streaming inference.
+## Whisper 
+WhisperEMMA is a streaming speech recognition framework based on OpenAI's Whisper. We introduce an EMMA-style modulation mechanism integrated directly into Whisper's text decoder to support low-latency transcription suitable for edge devices.
+
+![Original Whisper Architecture](assets/original-architecture.png)
+
+At a high level, Whisper comprises an audio encoder and a text decoder. We extend Whisper by injecting a stepwise probability network (`PChooseLayer`) into each `MonotonicResidualAttentionBlock` within the `MonotonicTextDecoder`, enabling monotonic attention during training and efficient streaming inference.
+
+![Modified Whisper Architecture](assets/modified-architecture.png)
+
+## Inference
+The WhisperEMMA inference algorithm enables real-time transcription by processing audio incrementally and deciding at each step whether to emit a text token or wait for more input. 
+
+It begins by initializing the output with a start-of-sequence token and processes incoming audio chunks through a speech encoder to generate partial hidden states. These are passed, along with the previously generated text, to a policy network that produces a score indicating whether the model is confident enough to generate the next token. If this score exceeds a predefined threshold $(t_{EMMA})$, the model proceeds to decode the next token. Otherwise, it stalls and waits for additional audio. 
+
+To avoid stalling indefinitely, the system tracks the number of consecutive stalls, and if a maximum stall count is reached, it forces the model to decode even if it lacks confidence. 
+
+This balance ensures low-latency transcription without freezing or excessive delays.
+
+![Inference Algorithm](assets/inference-algorithm.png)
 
 ## Monotonic Alignment Estimation
 In global attention, the model is allowed to focus on all parts of the input sequence when making predicitons. However, in a streaming setting, given an input sequence of length $l$, a model at time step $t$, $t \lt l$ is only allowed to focus on the first $t$ tokens of the sequence.
@@ -18,6 +36,10 @@ During training, the encoder parameters remain fixed, while optimization is perf
 
 To assess the impact of different finetuning strategies, we consider two variants: *WhisperEMMA-PChoose_Only*, which updates only the policy network, and *WhisperEMMA-Cross_Attn*, which additionally finetunes the cross-attention value projections within the decoder.
 
+## Use Case
+Streaming models such as [SeamlessStreaming](https://github.com/facebookresearch/seamless_communication) inspired the development of WhisperEMMA. However, due to their large size, such models may not be suitable for deployment on edge devices. To address this, we aimed to bring streaming capabilities to the more lightweight Whisper model.
+
+WhisperEMMA opens up the possibility to low-latency, offline transcription on edge devices like the [NVIDIA Jetson Orin NX](https://developer.nvidia.com/downloads/jetson-orin-nx-series-data-sheet). Its resource-efficient streaming architecture makes it well-suited for on-device speech applications that demand real-time responsiveness and prioritize user privacy.
 
 ## Setup
 We used Python 3.10, PyTorch 2.1.0, CUDA 11.8.0 to train and test our models, but the codebase is
@@ -49,11 +71,6 @@ choco install ffmpeg
 scoop install ffmpeg
 ```
 
-## Whisper 
-![Approach](https://raw.githubusercontent.com/openai/whisper/main/approach.png)
-
-Whisper is a general-purpose speech recognition model developed by OpenAI. At a high-level, it consists of an audio encoder and a text decoder. To inject the EMMA-style modulation mechanism to the text decoder, we add a `PChooseLayer` module to each `MonotonicResidualAttentionBlock` in the `MonotonicTextDecoder`. 
-
 
 ## Implementation
 The computations for `alpha` as described in our report are implemented in `PChooseLayer._monotonic_alignment`.
@@ -65,7 +82,7 @@ The computations for $\beta$ and modulation mechanism as described in our report
 ## Finetuning
 Our finetuning script is in `finetune-whisper-policy-network.py`. 
 
-All detailed explanations can be found in our report `report.pdf`, including the training and evaluation procedures.
+All detailed explanations can be found in our report (`report.pdf`), including the training and evaluation procedures.
 
 To run finetuning, simply run the following command:
 
@@ -75,7 +92,7 @@ python finetune-whisper-policy-network.py
 
 You can also specify the model checkpoints and the training parameters in the script. Details of our training parameters can also be found in our report.
 
-Our finetuned model weights can be found on HuggingFace [here](https://huggingface.co/keeve101/whisper-emma).
+Our finetuned model weights can be found on HuggingFace: https://huggingface.co/keeve101/whisper-emma.
 
 ## Evaluation
 For evaluation, please checkout to our evaluation branch via:
